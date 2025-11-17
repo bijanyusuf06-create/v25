@@ -1,28 +1,48 @@
-﻿import os
+import os
 import json
 import time
 import threading
+from flask import Flask, request
 from websocket import create_connection
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
+    ApplicationBuilder,
+    CommandHandler,
     ContextTypes
 )
 
-# --------------------------
+# --------------------------------------
 # ENVIRONMENT VARIABLES
-# --------------------------
+# --------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
 DERIV_APP_ID = "82074"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Example: https://your-app.leapcell.app
+
+PORT = 8080  # Leapcell requirement
 
 analyzing = False
 status_message = "Waiting..."
 
+# --------------------------------------
+# FLASK APP (Webhook receiver)
+# --------------------------------------
+app_flask = Flask(__name__)
+tg_app = None  # Created later
 
-# --------------------------
-# DERIV WEBSOCKET CONNECT
-# --------------------------
+
+@app_flask.post("/")
+def telegram_webhook():
+    """Handle incoming Telegram updates."""
+    if request.is_json:
+        update = Update.de_json(request.get_json(), tg_app.bot)
+        tg_app.update_queue.put(update)
+    return "OK", 200
+
+
+# --------------------------------------
+# DERIV WEBSOCKET
+# --------------------------------------
 def connect_deriv():
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     return create_connection(url)
@@ -42,14 +62,14 @@ def get_candles(symbol, timeframe, count=100):
     return data.get("candles", [])
 
 
-# --------------------------
-# PRICE ACTION LOGIC
-# --------------------------
-def analyze_market(chat_id, app):
+# --------------------------------------
+# ANALYSIS LOGIC (runs in separate thread)
+# --------------------------------------
+def analyze_market(chat_id, application):
     global analyzing, status_message
 
     async def send(msg):
-        await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        await application.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
     while analyzing:
         try:
@@ -78,7 +98,7 @@ def analyze_market(chat_id, app):
 
             status_message = f"Trend: {trend}"
 
-            # ------------ BOS (M5) ------------
+            # -------- BOS (M5) --------
             status_message = "Checking BOS..."
             time.sleep(1)
 
@@ -95,7 +115,7 @@ def analyze_market(chat_id, app):
                 time.sleep(2)
                 continue
 
-            # ------------ ORDER BLOCK (M1) ------------
+            # -------- ORDER BLOCK (M1) --------
             status_message = "Waiting for OB tap..."
             time.sleep(1)
 
@@ -106,38 +126,33 @@ def analyze_market(chat_id, app):
             rr = abs(entry - sl) * 5
             tp = entry + rr if trend == "BUY" else entry - rr
 
-            # ------------ CONFIRMATION WICK ------------
+            # -------- CONFIRM WICK --------
             status_message = "Checking wick confirmation..."
             time.sleep(1)
 
-            wick_ok = False
             c = m1[-1]
-
-            if trend == "BUY" and c["low"] <= ob["low"]:
-                wick_ok = True
-            if trend == "SELL" and c["high"] >= ob["high"]:
-                wick_ok = True
+            wick_ok = (
+                (trend == "BUY" and c["low"] <= ob["low"])
+                or (trend == "SELL" and c["high"] >= ob["high"])
+            )
 
             if not wick_ok:
                 status_message = "Wick invalid... waiting"
                 time.sleep(2)
                 continue
 
-            # ------------ SEND SIGNAL ------------
             msg = (
                 f"📢 *REAL SIGNAL — V25*\n\n"
                 f"Direction: {trend}\n"
                 f"Entry: {entry}\n"
                 f"SL: {sl}\n"
                 f"TP (1:5): {tp}\n"
-                f"Trend: {trend}\n"
                 f"BOS: True\n"
                 f"OB Tap: Confirmed\n"
                 f"Wick Confirmation: Yes"
             )
 
-            # Send asynchronously
-            app.create_task(send(msg))
+            application.create_task(send(msg))
 
             time.sleep(10)
 
@@ -146,59 +161,60 @@ def analyze_market(chat_id, app):
             time.sleep(3)
 
 
-# --------------------------
-# COMMANDS
-# --------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --------------------------------------
+# BOT COMMANDS
+# --------------------------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome!\n\n"
-        "⚠️ Disclaimer:\n"
-        "- Only stake money you are willing to lose.\n"
-        "- No bot or strategy is 100% correct.\n"
-        "- This bot analyzes REAL V25 data.\n\n"
-        "Use /analyze to begin."
+        "Welcome!\n\nUse /analyze to start market analysis.\nUse /stop to stop."
     )
 
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global analyzing
     if analyzing:
         await update.message.reply_text("Already analyzing...")
         return
 
     analyzing = True
-
     chat_id = update.message.chat_id
-    app = context.application
+    application = context.application
 
-    t = threading.Thread(target=analyze_market, args=(chat_id, app))
-    t.start()
-
-    await update.message.reply_text("Analyzing the market now...")
+    threading.Thread(target=analyze_market, args=(chat_id, application)).start()
+    await update.message.reply_text("Started analyzing...")
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global analyzing
     analyzing = False
-    await update.message.reply_text("Analyzing stopped.")
+    await update.message.reply_text("Stopped analyzing.")
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Current status:\n{status_message}")
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Status: {status_message}")
 
 
-# --------------------------
-# RUN BOT
-# --------------------------
+# --------------------------------------
+# RUN APP (Webhook mode)
+# --------------------------------------
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    global tg_app
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("status", status))
+    tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.run_polling()
+    tg_app.add_handler(CommandHandler("start", start_cmd))
+    tg_app.add_handler(CommandHandler("analyze", analyze_cmd))
+    tg_app.add_handler(CommandHandler("stop", stop_cmd))
+    tg_app.add_handler(CommandHandler("status", status_cmd))
+
+    # Set Telegram webhook
+    tg_app.bot.set_webhook(url=WEBHOOK_URL)
+
+    # Start bot in background
+    threading.Thread(target=tg_app.run_polling, daemon=True).start()
+
+    # Start Flask server (port 8080)
+    app_flask.run(host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
